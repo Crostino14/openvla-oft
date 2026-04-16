@@ -180,10 +180,13 @@ def check_model_logic_mismatch(pretrained_checkpoint: str) -> None:
     if not os.path.isdir(pretrained_checkpoint):
         return
 
-    # Find current files
+    # Find current files - use absolute path based on this file's location
+    # to avoid issues when CWD differs (e.g., SLURM jobs running from vla-scripts/)
     curr_files = {"modeling_prismatic.py": None, "configuration_prismatic.py": None}
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    prismatic_dir = os.path.join(project_root, "prismatic")
 
-    for root, _, files in os.walk("./prismatic/"):
+    for root, _, files in os.walk(prismatic_dir):
         for filename in curr_files.keys():
             if filename in files and curr_files[filename] is None:
                 curr_files[filename] = os.path.join(root, filename)
@@ -323,8 +326,8 @@ def _apply_film_to_vla(vla: torch.nn.Module, cfg: Any) -> torch.nn.Module:
 
     # Apply LoRA configuration
     lora_config = LoraConfig(
-        r=cfg.lora_rank,
-        lora_alpha=min(cfg.lora_rank, 16),
+        r=32,
+        lora_alpha=16,
         lora_dropout=0.0,
         target_modules="all-linear",
         init_lora_weights="gaussian",
@@ -417,7 +420,6 @@ def get_proprio_projector(cfg: Any, llm_dim: int, proprio_dim: int) -> ProprioPr
             "moojink/openvla-7b-oft-finetuned-libero-object": "proprio_projector--150000_checkpoint.pt",
             "moojink/openvla-7b-oft-finetuned-libero-goal": "proprio_projector--50000_checkpoint.pt",
             "moojink/openvla-7b-oft-finetuned-libero-10": "proprio_projector--150000_checkpoint.pt",
-            "moojink/openvla-7b-oft-finetuned-libero-spatial-object-goal-10": "proprio_projector--300000_checkpoint.pt",
         }
         if cfg.pretrained_checkpoint not in model_path_to_proprio_projector_name.keys():
             raise ValueError("Unsupported HF Hub pretrained checkpoint found!")
@@ -482,10 +484,8 @@ def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, Dif
         action_head = L1RegressionActionHead(input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM)
     elif cfg.use_diffusion:
         action_head = DiffusionActionHead(
-            input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM, num_diffusion_steps_train=cfg.num_diffusion_steps_train
+            input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM, num_diffusion_steps=cfg.num_diffusion_steps
         )
-        # Set number of diffusion steps for inference
-        action_head.noise_scheduler.set_timesteps(cfg.num_diffusion_steps_inference)
     else:
         raise ValueError("Either use_l1_regression or use_diffusion must be True")
 
@@ -499,7 +499,6 @@ def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, Dif
             "moojink/openvla-7b-oft-finetuned-libero-object": "action_head--150000_checkpoint.pt",
             "moojink/openvla-7b-oft-finetuned-libero-goal": "action_head--50000_checkpoint.pt",
             "moojink/openvla-7b-oft-finetuned-libero-10": "action_head--150000_checkpoint.pt",
-            "moojink/openvla-7b-oft-finetuned-libero-spatial-object-goal-10": "action_head--300000_checkpoint.pt",
         }
         if cfg.pretrained_checkpoint not in model_path_to_action_head_name.keys():
             raise ValueError("Unsupported HF Hub pretrained checkpoint found!")
@@ -745,7 +744,7 @@ def get_vla_action(
         # Collect all input images
         all_images = [obs["full_image"]]
         if cfg.num_images_in_input > 1:
-            all_images.extend([obs[k] for k in obs.keys() if "wrist" in k])
+            all_images.extend([obs[k] for k in obs.keys() if "wrist" in k or 'camera_gripper_image' in k])
 
         # Process images
         all_images = prepare_images_for_vla(all_images, cfg)
@@ -793,9 +792,11 @@ def get_vla_action(
                 action_head=action_head,
                 use_film=use_film,
             )
+        
 
-    # Return action chunk as list of actions
-    return [action[i] for i in range(len(action))]
+
+    # Extract subset of actions for open loop steps
+    return [action[i] for i in range(min(len(action), cfg.num_open_loop_steps))]
 
 
 def get_action_from_server(

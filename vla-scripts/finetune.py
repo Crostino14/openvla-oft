@@ -28,7 +28,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 import wandb
 
-from experiments.robot.openvla_utils import (
+from experiments.openvla_utils import (
     check_model_logic_mismatch,
     model_is_on_hf_hub,
     update_auto_map,
@@ -60,10 +60,22 @@ from prismatic.vla.constants import (
 )
 from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
+import random
+import numpy as np
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+def seed_everything(seed=42):
+    print(f"Cuda available {torch.cuda.is_available()}")
+    random.seed(seed)
+    np.random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    # tf.random.set_seed(seed)
 
 @dataclass
 class FinetuneConfig:
@@ -79,7 +91,7 @@ class FinetuneConfig:
     # Algorithm and architecture
     use_l1_regression: bool = True                   # If True, trains continuous action head with L1 regression objective
     use_diffusion: bool = False                      # If True, trains continuous action head with diffusion modeling objective (DDIM)
-    num_diffusion_steps_train: int = 50              # (When `diffusion==True`) Number of diffusion steps used for training
+    num_diffusion_steps: int = 50                    # (When `diffusion==True`) Number of diffusion steps for training
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = False                        # If True, includes robot proprioceptive state in input
@@ -256,8 +268,22 @@ def init_module(
     count_parameters(module, module_name)
 
     if cfg.resume:
-        state_dict = load_checkpoint(module_name, cfg.vla_path, cfg.resume_step)
+        # Only rank 0 loads from disk
+        if dist.get_rank() == 0:
+            state_dict = load_checkpoint(module_name, cfg.vla_path, cfg.resume_step)
+        else:
+            state_dict = None
+
+        # Broadcast state_dict to all ranks
+        obj_list = [state_dict]
+        dist.broadcast_object_list(obj_list, src=0)
+        state_dict = obj_list[0]
+
         module.load_state_dict(state_dict)
+
+        # Ensure all ranks finish before moving on
+        dist.barrier()
+
 
     if to_bf16:
         module = module.to(torch.bfloat16)
@@ -280,7 +306,7 @@ def run_forward_pass(
     use_film,
     num_patches,
     compute_diffusion_l1=False,
-    num_diffusion_steps_train=None,
+    num_diffusion_steps=None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Compute model forward pass and metrics for both training and validation.
@@ -300,7 +326,7 @@ def run_forward_pass(
         num_patches (int): Number of vision patches.
         compute_diffusion_l1 (bool): Whether to sample actions and compute L1 loss for diffusion (do this once every
                                     diffusion_sample_freq steps during training; do it every batch for validation)
-        num_diffusion_steps_train (int): Number of diffusion steps for training (only used for diffusion).
+        num_diffusion_steps (int): Number of diffusion steps (only used for diffusion).
 
     Returns:
         tuple: (loss, metrics_dict)
@@ -338,7 +364,6 @@ def run_forward_pass(
             diffusion_timestep_embeddings=diffusion_timestep_embeddings if use_diffusion else None,
             use_film=use_film,
         )
-
     # Get action masks needed for logging
     ground_truth_token_ids = batch["labels"][:, 1:].to(device_id)
     current_action_mask = get_current_action_mask(ground_truth_token_ids)
@@ -485,7 +510,7 @@ def run_diffusion_sampling(
     )  # (B, chunk_len, action_dim)
 
     # Set diffusion timestep values
-    action_head.module.noise_scheduler.set_timesteps(action_head.module.num_diffusion_steps_train)
+    action_head.module.noise_scheduler.set_timesteps(action_head.module.num_diffusion_steps)
 
     # Reverse diffusion: Iteratively denoise to generate action, conditioned on observation
     curr_noisy_actions = noise
@@ -723,7 +748,7 @@ def run_validation(
                 use_film=cfg.use_film,
                 num_patches=num_patches,
                 compute_diffusion_l1=True,
-                num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
+                num_diffusion_steps=cfg.num_diffusion_steps if cfg.use_diffusion else None,
             )
 
             # Add the loss value to the metrics
@@ -775,6 +800,11 @@ def finetune(cfg: FinetuneConfig) -> None:
     cfg.vla_path = cfg.vla_path.rstrip("/")
     print(f"Fine-tuning OpenVLA Model `{cfg.vla_path}` on `{cfg.dataset_name}`")
 
+    if 'rm_12_13_14_15' in cfg.dataset_name:
+        seed_everything(seed=0)
+    else:
+        seed_everything(seed=42)
+
     # Get experiment run ID
     run_id = get_run_id(cfg)
 
@@ -798,7 +828,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         f"\tNUM_ACTIONS_CHUNK: {NUM_ACTIONS_CHUNK}\n"
         f"\tACTION_DIM: {ACTION_DIM}\n"
         f"\tPROPRIO_DIM: {PROPRIO_DIM}\n"
-        f"\tACTION_PROPRIO_NORMALIZATION_TYPE: {ACTION_PROPRIO_NORMALIZATION_TYPE}"
+        f"\tACTION_PROPRIO_NORMALIZATION_TYPE: {ACTION_PROPRIO_NORMALIZATION_TYPE}\n",
+        f"\tUSE PROPRIO: {cfg.use_proprio}",
     )
 
     # Two options:
@@ -838,9 +869,18 @@ def finetune(cfg: FinetuneConfig) -> None:
         low_cpu_mem_usage=True,
         trust_remote_code=True,
     ).to(device_id)
-
+    #  # ,
     # Set number of images in VLA input
-    vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
+    try:
+        vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
+    except AttributeError:
+        print(
+            "Warning: `set_num_images_in_input` method not found in VLA model. "
+            "Please check if the model supports this method."
+        )
+
+    # Save llm_dim before any wrapping (access via config if attribute doesn't exist)
+    llm_dim = getattr(vla, 'llm_dim', vla.config.text_config.hidden_size)
 
     # LoRA setup
     if cfg.use_lora:
@@ -863,7 +903,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         # original one (due to the LoRA wrapper)
         vla.model.vision_backbone = FiLMedPrismaticVisionBackbone(
             vision_backbone=vla.model.vision_backbone,
-            llm_dim=vla.llm_dim,
+            llm_dim=llm_dim,
         )
         count_parameters(vla.vision_backbone, "vla.vision_backbone (post-wrap)")
         if cfg.resume:
@@ -881,7 +921,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             "proprio_projector",
             cfg,
             device_id,
-            {"llm_dim": vla.module.llm_dim, "proprio_dim": PROPRIO_DIM},
+            {"llm_dim": llm_dim, "proprio_dim": PROPRIO_DIM},
         )
 
     # If applicable, instantiate continuous action head for L1 regression
@@ -891,9 +931,10 @@ def finetune(cfg: FinetuneConfig) -> None:
             "action_head",
             cfg,
             device_id,
-            {"input_dim": vla.module.llm_dim, "hidden_dim": vla.module.llm_dim, "action_dim": ACTION_DIM},
+            {"input_dim": llm_dim, "hidden_dim": llm_dim, "action_dim": ACTION_DIM},
             to_bf16=True,
         )
+    # {"input_dim": vla.module.llm_dim, "hidden_dim": vla.module.llm_dim, "action_dim": ACTION_DIM},
 
     # If applicable, instantiate diffusion action head and noisy action projector
     if cfg.use_diffusion:
@@ -903,19 +944,25 @@ def finetune(cfg: FinetuneConfig) -> None:
             cfg,
             device_id,
             {
-                "input_dim": vla.module.llm_dim,
-                "hidden_dim": vla.module.llm_dim,
+                "input_dim": llm_dim,
+                "hidden_dim": llm_dim,
                 "action_dim": ACTION_DIM,
-                "num_diffusion_steps_train": cfg.num_diffusion_steps_train,
+                "num_diffusion_steps": cfg.num_diffusion_steps,
             },
             to_bf16=True,
         )
         noisy_action_projector = init_module(
-            NoisyActionProjector, "noisy_action_projector", cfg, device_id, {"llm_dim": vla.module.llm_dim}
+            NoisyActionProjector, "noisy_action_projector", cfg, device_id, {"llm_dim": llm_dim}
         )
 
     # Get number of vision patches
-    NUM_PATCHES = vla.module.vision_backbone.get_num_patches() * vla.module.vision_backbone.get_num_images_in_input()
+    vision_backbone = vla.module.vision_backbone
+    if hasattr(vision_backbone, 'get_num_patches'):
+        NUM_PATCHES = vision_backbone.get_num_patches() * vision_backbone.get_num_images_in_input()
+    else:
+        num_patches = vision_backbone.featurizer.patch_embed.num_patches
+        num_images = getattr(vision_backbone, 'num_images_in_input', 1)
+        NUM_PATCHES = num_patches * num_images
     # If we have proprio inputs, a single proprio embedding is appended to the end of the vision patch embeddings
     if cfg.use_proprio:
         NUM_PATCHES += 1
@@ -1027,8 +1074,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         "next_actions_accuracy": deque(maxlen=cfg.grad_accumulation_steps),
         "next_actions_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
     }
-
-    # Start training
+    
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
         vla.train()
         optimizer.zero_grad()
@@ -1049,7 +1095,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 use_film=cfg.use_film,
                 num_patches=NUM_PATCHES,
                 compute_diffusion_l1=compute_diffusion_l1,
-                num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
+                num_diffusion_steps=cfg.num_diffusion_steps if cfg.use_diffusion else None,
             )
 
             # Normalize loss to account for gradient accumulation
@@ -1139,4 +1185,11 @@ def finetune(cfg: FinetuneConfig) -> None:
 
 
 if __name__ == "__main__":
+    # import debugpy
+    # debugpy.listen(('0.0.0.0', 5679))
+    # print("Waiting for debugger attach")
+    # debugpy.wait_for_client()
+    
+    
+    
     finetune()

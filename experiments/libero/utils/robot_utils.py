@@ -7,8 +7,8 @@ from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import torch
-
-from experiments.robot.openvla_utils import (
+import tensorflow as tf
+from experiments.openvla_utils import (
     get_vla,
     get_vla_action,
 )
@@ -49,6 +49,8 @@ def set_seed_everywhere(seed: int) -> None:
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     os.environ["PYTHONHASHSEED"] = str(seed)
+    # tf.config.experimental.enable_op_determinism()
+    # tf.random.set_seed(seed)
 
 
 def get_model(cfg: Any, wrap_diffusion_policy_for_droid: bool = False) -> torch.nn.Module:
